@@ -36,7 +36,7 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual((bins / 'cnip').read_bytes(), (ROOT / 'cnip.py').read_bytes())
             self.assertEqual((root / 'download.log').exists(), not local)
             version = subprocess.run(['cnip', '--version'], env=env, capture_output=True, text=True)
-            self.assertEqual(version.stdout.strip(), '1.0.3')
+            self.assertEqual(version.stdout.strip(), '1.0.4')
             # Redirect locking to a temporary path, leaving host state untouched.
             cli = bins / 'cnip'
             cli.write_text(cli.read_text().replace("Path('/run/lock/cnip.lock')", repr(root / 'lock').replace('PosixPath', 'Path')))

@@ -46,11 +46,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Publish v1.0.3 only after all checks pass
+      - name: Publish v1.0.4 only after all checks pass
         uses: actions/github-script@v7
         with:
           script: |
-            const tag = 'v1.0.3';
+            const tag = 'v1.0.4';
             const repo = context.repo;
             try {
               await github.rest.repos.getReleaseByTag({...repo, tag});
@@ -63,17 +63,17 @@ jobs:
               ...repo,
               tag_name: tag,
               target_commitish: context.sha,
-              name: 'cn-ip v1.0.3',
+              name: 'cn-ip v1.0.4',
               body: [
-                '统一其他管理页面的排版，改善诊断、备份与操作结果的阅读体验。',
+                '新增旧版域名规则的交互确认迁移。',
                 '',
-                '- 诊断和自动更新状态分区显示，检查结论及后续操作更清楚。',
-                '- 备份列表增加序号，交互恢复支持序号或完整名称。',
-                '- 配置变更显示三步进度，成功结果与备份路径分行展示。',
-                '- 卸载结果分别说明规则、命令文件、定时更新及备份状态。',
-                '- 保留 Enter 返回、Ctrl+C 退出及自动回滚逻辑。',
+                '- 菜单 1 检测到已知旧 include 后，显示变更范围并要求明确确认。',
+                '- 仅替换目标 server 的旧引用，保留共享旧文件与其他网站引用。',
+                '- 同一 server 存在其他未选择域名或嵌套旧规则时，安全停止。',
+                '- 配置变更沿用自动备份、验证、重载与失败回滚流程。',
+                '- 修复注释中的旧路径被误认为有效规则的问题。',
                 '',
-                '升级前在旧菜单输入 0 退出，再重新执行 README 中的安装命令。'
+                '旧文件中的自定义放行 IP 不会自动导入，请迁移前核实并另行添加。'
               ].join('\n'),
               draft: false,
               prerelease: false

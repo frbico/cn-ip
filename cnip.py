@@ -22,7 +22,7 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-VERSION = '1.0.3'
+VERSION = '1.0.4'
 CONF_DEST = '/usr/local/openresty/nginx/conf/conf.d'
 NGINX = '/usr/local/openresty/nginx/sbin/nginx'
 GLOBAL_FILENAME = '00-cnip-managed.conf'
@@ -45,6 +45,11 @@ SYSTEMD_TIMER = Path('/etc/systemd/system/cnip-update.timer')
 
 
 class CnipError(Exception):
+    pass
+
+
+class LegacyRuleError(CnipError):
+    """An active legacy include needs explicit migration consent."""
     pass
 
 
@@ -278,7 +283,27 @@ def server_blocks(text: str) -> List[Tuple[int, int, Set[str]]]:
     return blocks
 
 
-def updates_for_domains(env: Environment, selected: Set[str], required: Optional[str] = None) -> Dict[Path, str]:
+def legacy_includes(block: str) -> List[Tuple[int, int, int, str]]:
+    """Find actual include directives, excluding comments and quoted messages."""
+    tokens = tokenize(block)
+    depth = 0
+    found = []
+    for i, (value, start, _) in enumerate(tokens):
+        if value == '{':
+            depth += 1
+        elif value == '}':
+            depth -= 1
+        if (value == 'include' and i + 2 < len(tokens)
+                and (i == 0 or tokens[i - 1][0] in (';', '{', '}'))
+                and tokens[i + 2][0] == ';'):
+            path = tokens[i + 1][0].strip('\"\'')
+            if path in OLD_GUARDS:
+                found.append((start, tokens[i + 2][2], depth, path))
+    return found
+
+
+def updates_for_domains(env: Environment, selected: Set[str], required: Optional[str] = None,
+                        migrate_legacy: bool = False) -> Dict[Path, str]:
     updates: Dict[Path, str] = {}
     found = False
     for path in sorted(env.confdir.glob('*.conf')):
@@ -293,9 +318,23 @@ def updates_for_domains(env: Environment, selected: Set[str], required: Optional
             must_guard = bool(names & selected)
             existing_marked = re.search(r'(?m)^[ \t]*include[ \t]+/www/\.cnip/guard\.conf;[ \t]*#[ \t]*CNIP-MANAGED[ \t]*\r?\n?', block)
             if must_guard:
-                for legacy in OLD_GUARDS:
-                    if re.search(r'\binclude\s+' + re.escape(legacy) + r'\s*;', block):
-                        raise CnipError(f'{path} 存在旧版限制规则 {legacy}。请先迁移旧规则再启用。')
+                legacy = legacy_includes(block)
+                if legacy:
+                    if not migrate_legacy:
+                        raise LegacyRuleError(f'{path} 存在旧版限制规则 {legacy[0][3]}。'
+                                              '请使用 cnip 菜单 1 确认迁移后再启用。')
+                    if not required or required not in names:
+                        raise CnipError(f'{path} 的其他域名仍有旧规则，请逐个域名迁移。')
+                    unrelated = names - selected
+                    if unrelated:
+                        raise CnipError(f'{path} 的同一 server 还包含其他域名：' +
+                                        ', '.join(sorted(unrelated)) +
+                                        '。为避免移除它们的旧限制，已停止迁移。'
+                                        '请先在 1Panel 将目标域名分离为独立网站配置。')
+                    if any(depth != 0 for _, _, depth, _ in legacy):
+                        raise CnipError(f'{path} 的旧规则位于嵌套配置块中，需人工检查后迁移。')
+                    for a, b, _, _ in legacy:
+                        changes.append((start + a, start + b, ''))
                 if not existing_marked:
                     if re.search(r'\binclude\s+' + re.escape(GUARD_PATH) + r'\s*;', block):
                         raise CnipError(f'{path} 存在未标记的 cnip include，拒绝重复修改。')
@@ -424,7 +463,7 @@ def nginx_verify(env: Environment, require_global: bool) -> None:
 
 def transact(env: Environment, new_state: dict, action: str,
              new_geo: Optional[str] = None, delete_all: bool = False,
-             required: Optional[str] = None) -> Path:
+             required: Optional[str] = None, migrate_legacy: bool = False) -> Path:
     if env.storage.is_symlink():
         raise CnipError('cnip 数据目录不允许是符号链接。')
     env.storage.mkdir(mode=0o755, parents=True, exist_ok=True)
@@ -439,7 +478,7 @@ def transact(env: Environment, new_state: dict, action: str,
     env.nginx('-t')
     configs = generate_configs(new_state)
     selected = set(new_state['domains'])
-    modifications = updates_for_domains(env, selected, required=required)
+    modifications = updates_for_domains(env, selected, required=required, migrate_legacy=migrate_legacy)
     planned: Dict[Path, Optional[str]] = dict(modifications)
     paths = owned_files(env)
     if delete_all:
@@ -481,21 +520,47 @@ def transact(env: Environment, new_state: dict, action: str,
     return folder
 
 
-def do_add(env: Environment, name: str, quiet: bool = False) -> None:
+def do_add(env: Environment, name: str, quiet: bool = False, migrate_legacy: bool = False) -> None:
     name = domain_name(name)
     state = load_state(env)
-    if name in state['domains']:
+    # Validate all affected blocks before downloading or writing any files.
+    updates_for_domains(env, set(state['domains']) | {name}, required=name, migrate_legacy=migrate_legacy)
+    if name in state['domains'] and not migrate_legacy:
         print(f'{name} 已受保护。可运行 cnip doctor 检查配置，或 cnip repair 修复规则。')
         return
-    # Check target before downloading data.
-    updates_for_domains(env, set(state['domains']) | {name}, required=name)
     geo = None
     if not (env.storage / 'china.geo').exists():
         geo, state['ipv4_count'], state['ipv6_count'] = download_database(quiet)
         state['ip_updated_at'] = dt.datetime.now(dt.timezone.utc).isoformat()
     state['domains'] = sorted(set(state['domains']) | {name})
-    backup = transact(env, state, 'add', geo, required=name)
+    backup = transact(env, state, 'migrate-legacy' if migrate_legacy else 'add', geo,
+                      required=name, migrate_legacy=migrate_legacy)
     completed(f'已为 {name} 启用仅中国大陆 IP 访问。', backup)
+
+
+def add_interactive(env: Environment, name: str) -> None:
+    try:
+        do_add(env, name)
+    except LegacyRuleError as error:
+        name = domain_name(name)
+        state = load_state(env)
+        # A dry run proves that no unrelated hostnames or nested rules will be changed.
+        changes = updates_for_domains(env, set(state['domains']) | {name},
+                                      required=name, migrate_legacy=True)
+        section('检测到旧规则 · 迁移确认')
+        print('  ' + str(error))
+        field('目标域名', name)
+        print('  将修改的网站配置：')
+        for path in changes:
+            print('    • ' + str(path))
+        print('\n  仅移除目标 server 中已识别的旧 include，替换为 cnip 规则。')
+        print('  共享旧规则文件及其他网站的引用会保留。')
+        print('  旧文件中的自定义放行 IP 不会自动导入，请另行添加。')
+        print('  写入前自动备份，检测或重载失败自动回滚。')
+        if yn('确认迁移上述旧规则并开启限制？'):
+            do_add(env, name, migrate_legacy=True)
+        else:
+            print('  已取消迁移，网站配置保持不变。')
 
 
 def do_remove(env: Environment, name: str) -> None:
@@ -880,7 +945,7 @@ def menu_loop() -> None:
                 if choice not in ('3', '9'):
                     print(f'  已识别：{env.container}', flush=True)
                 if choice == '1':
-                    do_add(env, input('输入需要限制的完整域名：'))
+                    add_interactive(env, input('输入需要限制的完整域名：'))
                 elif choice == '2':
                     do_remove(env, input('输入需要取消限制的完整域名：'))
                 elif choice == '3':
