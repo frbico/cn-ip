@@ -46,11 +46,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Publish v1.0.2 only after all checks pass
+      - name: Publish v1.0.3 only after all checks pass
         uses: actions/github-script@v7
         with:
           script: |
-            const tag = 'v1.0.2';
+            const tag = 'v1.0.3';
             const repo = context.repo;
             try {
               await github.rest.repos.getReleaseByTag({...repo, tag});
@@ -63,15 +63,15 @@ jobs:
               ...repo,
               tag_name: tag,
               target_commitish: context.sha,
-              name: 'cn-ip v1.0.2',
+              name: 'cn-ip v1.0.3',
               body: [
-                '优化中文终端界面，提升菜单与状态结果的可读性。',
+                '统一其他管理页面的排版，改善诊断、备份与操作结果的阅读体验。',
                 '',
-                '- 主菜单按域名与 IP 库、访问例外、维护与备份分组，统一编号与间距。',
-                '- 状态页分区显示运行环境、域名、IP 地址库和访问例外。',
-                '- 中文标签按显示宽度对齐，时间去除微秒并明确显示服务器本地时区。',
-                '- 删除重复容器信息，自动更新子菜单与备份页采用清晰分行排版。',
-                '- 保留 Enter 返回主菜单、所有输入处 Ctrl+C 退出及中断回滚逻辑。',
+                '- 诊断和自动更新状态分区显示，检查结论及后续操作更清楚。',
+                '- 备份列表增加序号，交互恢复支持序号或完整名称。',
+                '- 配置变更显示三步进度，成功结果与备份路径分行展示。',
+                '- 卸载结果分别说明规则、命令文件、定时更新及备份状态。',
+                '- 保留 Enter 返回、Ctrl+C 退出及自动回滚逻辑。',
                 '',
                 '升级前在旧菜单输入 0 退出，再重新执行 README 中的安装命令。'
               ].join('\n'),

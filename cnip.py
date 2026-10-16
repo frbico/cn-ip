@@ -22,7 +22,7 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-VERSION = '1.0.2'
+VERSION = '1.0.3'
 CONF_DEST = '/usr/local/openresty/nginx/conf/conf.d'
 NGINX = '/usr/local/openresty/nginx/sbin/nginx'
 GLOBAL_FILENAME = '00-cnip-managed.conf'
@@ -435,7 +435,7 @@ def transact(env: Environment, new_state: dict, action: str,
         require_owned(path, header)
     if env.statefile.is_symlink():
         raise CnipError('状态文件不允许是符号链接。')
-    print('正在检查现有 OpenResty 配置……', flush=True)
+    print('\n  [1/3] 正在检查现有 OpenResty 配置……', flush=True)
     env.nginx('-t')
     configs = generate_configs(new_state)
     selected = set(new_state['domains'])
@@ -457,7 +457,7 @@ def transact(env: Environment, new_state: dict, action: str,
         if new_geo is not None:
             planned[env.storage / 'china.geo'] = new_geo
     folder = backup_snapshot(list(planned), action)
-    print(f'已备份：{folder}，正在写入并验证配置……', flush=True)
+    print('  [2/3] 备份已保存，正在写入并验证配置……', flush=True)
     try:
         for path, value in planned.items():
             if value is None:
@@ -465,10 +465,11 @@ def transact(env: Environment, new_state: dict, action: str,
             else:
                 put_file(path, value)
         nginx_verify(env, bool(selected))
-        print('配置检查通过，正在重载 OpenResty……', flush=True)
+        print('  [3/3] 配置检查通过，正在重载 OpenResty……', flush=True)
         env.nginx('-s', 'reload')
     except (Exception, KeyboardInterrupt):
-        print('⚠️ 应用失败，正在恢复修改前配置……', file=sys.stderr)
+        print('\n  [回滚] 应用中断或失败，正在恢复修改前配置……', file=sys.stderr)
+        print(f'  备份位置：{folder}', file=sys.stderr)
         restore_snapshot(folder, env)
         try:
             env.nginx('-t')
@@ -494,7 +495,7 @@ def do_add(env: Environment, name: str, quiet: bool = False) -> None:
         state['ip_updated_at'] = dt.datetime.now(dt.timezone.utc).isoformat()
     state['domains'] = sorted(set(state['domains']) | {name})
     backup = transact(env, state, 'add', geo, required=name)
-    print(f'✅ 已为 {name} 启用仅中国大陆 IP 访问，备份：{backup}')
+    completed(f'已为 {name} 启用仅中国大陆 IP 访问。', backup)
 
 
 def do_remove(env: Environment, name: str) -> None:
@@ -505,7 +506,7 @@ def do_remove(env: Environment, name: str) -> None:
         return
     state['domains'].remove(name)
     backup = transact(env, state, 'remove')
-    print(f'✅ 已取消 {name} 的 cnip 限制，备份：{backup}')
+    completed(f'已取消 {name} 的 cnip 限制。', backup)
 
 
 def do_update(env: Environment, quiet: bool = False) -> None:
@@ -518,7 +519,7 @@ def do_update(env: Environment, quiet: bool = False) -> None:
     state['ip_updated_at'] = dt.datetime.now(dt.timezone.utc).isoformat()
     backup = transact(env, state, 'update', geo)
     if not quiet:
-        print(f'✅ IP 库已更新并重载 OpenResty，备份：{backup}')
+        completed('IP 库已更新并重载 OpenResty。', backup)
 
 
 def do_allow(env: Environment, action: str, value: str) -> None:
@@ -539,7 +540,7 @@ def do_allow(env: Environment, action: str, value: str) -> None:
         allowed.remove(value)
     state['extra_allow'] = sorted(allowed)
     folder = transact(env, state, 'allow-' + action)
-    print(f'✅ 已{ "放行" if action == "add" else "删除放行" } {value}，备份：{folder}')
+    completed(f'已{"放行" if action == "add" else "删除放行"} {value}。', folder)
 
 
 def do_acme(env: Environment, enabled: bool) -> None:
@@ -548,7 +549,7 @@ def do_acme(env: Environment, enabled: bool) -> None:
         raise CnipError('还没有受保护的域名。')
     state['acme_exempt'] = enabled
     folder = transact(env, state, 'acme')
-    print(f'✅ ACME HTTP-01 验证路径例外：{ "已开启" if enabled else "已关闭" }，备份：{folder}')
+    completed('ACME HTTP-01 验证路径例外：' + ('已开启。' if enabled else '已关闭。'), folder)
 
 
 def do_repair(env: Environment) -> None:
@@ -558,7 +559,7 @@ def do_repair(env: Environment) -> None:
     for name in state['domains']:
         updates_for_domains(env, set(state['domains']), required=name)
     folder = transact(env, state, 'repair')
-    print(f'✅ 已重新同步配置，备份：{folder}')
+    completed('已重新同步网站规则。', folder)
 
 
 def section(title: str) -> None:
@@ -571,6 +572,19 @@ def field(label: str, value: object) -> None:
     label += '：'
     width = sum(2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1 for ch in label)
     print('  ' + label + ' ' * max(1, 14 - width) + str(value))
+
+
+def completed(message: str, backup: Optional[Path] = None) -> None:
+    print('\n  [完成] ' + message)
+    if backup is not None:
+        field('备份位置', backup)
+
+
+def show_error(error: Exception, stream=None) -> None:
+    stream = stream or sys.stdout
+    print('\n  [失败] 操作失败', file=stream)
+    for line in str(error).splitlines():
+        print('  ' + line, file=stream)
 
 
 def readable_time(value: Optional[str]) -> str:
@@ -619,28 +633,40 @@ def do_list(env: Environment) -> None:
 
 def do_doctor(env: Environment) -> None:
     state = load_state(env)
-    print(f'cnip {VERSION} | 容器：{env.container}')
-    print('挂载：', env.webroot, '-> /www')
-    print('网站配置：', env.confdir, '->', CONF_DEST)
-    print('Nginx 配置检查中……')
+    section('诊断环境')
+    field('工具版本', VERSION)
+    field('OpenResty', env.container)
+    field('网站目录', env.webroot)
+    field('配置目录', env.confdir)
+    section('配置与网站规则')
+    print('  正在检查 Nginx 配置……', flush=True)
     nginx_verify(env, bool(state['domains']))
-    print('✅ Nginx -t 成功，全局 cnip 配置加载正常。' if state['domains'] else '✅ Nginx -t 成功。')
+    print('  [通过] Nginx 配置有效。')
+    if state['domains']:
+        print('  [通过] cnip 全局配置已加载。')
+    else:
+        print('  [提示] 暂无受保护域名。')
     for name in state['domains']:
         updates = updates_for_domains(env, set(state['domains']), required=name)
         if updates:
-            print(f'⚠️ {name} 的部分 server 缺失 cnip 标记，请运行 cnip repair。')
+            print(f'  [待修复] {name} 的部分 server 缺失 cnip 标记。')
+            print('           请运行 cnip repair 或选择主菜单 10。')
         else:
-            print(f'✅ {name} 的 server 标记完整。')
+            print(f'  [通过] {name} 的网站标记完整。')
+    section('IP 库与证书验证')
+    field('IP 库更新', readable_time(state['ip_updated_at']))
     if state['ip_updated_at']:
         try:
             last = dt.datetime.fromisoformat(state['ip_updated_at'])
             if (dt.datetime.now(dt.timezone.utc) - last).days > 30:
-                print('⚠️ IP 库超过 30 天未更新。')
-        except ValueError:
-            print('⚠️ IP 更新时间格式异常。')
+                print('  [提醒] IP 库超过 30 天未更新，请选择主菜单 4。')
+        except (ValueError, TypeError):
+            print('  [提醒] 更新时间或时区格式异常。')
     if not state['acme_exempt']:
-        print('⚠️ 已关闭 ACME 路径例外，HTTP-01 续期可能失败。')
-    print('注意：这里只检查配置，不能代替从境外/境内网络实际访问测试。')
+        print('  [提醒] HTTP-01 路径例外已关闭，证书续期可能失败。')
+    else:
+        print('  [通过] HTTP-01 证书验证路径例外已开启。')
+    print('\n  请另用境内、境外网络访问网站，确认实际效果。')
 
 
 def backup_dirs() -> List[Path]:
@@ -650,8 +676,8 @@ def backup_dirs() -> List[Path]:
 def do_backups() -> None:
     dirs = backup_dirs()
     section('配置备份 · 最近 20 份')
-    for path in dirs[:20]:
-        print('  ', path.name)
+    for number, path in enumerate(dirs[:20], 1):
+        print(f'  {number:>2}. {path.name}')
     if not dirs:
         print('  （无）')
     field('备份目录', BACKUPS)
@@ -682,18 +708,24 @@ def do_restore(env: Environment, name: str) -> None:
             env.nginx('-t')
             env.nginx('-s', 'reload')
         raise
-    print(f'✅ 已恢复 {name}，如需撤销本次恢复：cnip restore {rollback.name}')
+    completed(f'已恢复 {name}。')
+    field('撤销本次恢复', f'cnip restore {rollback.name}')
 
 
 def systemd_action(action: str) -> None:
     if action == 'status':
+        section('自动更新状态')
         if not Path('/run/systemd/system').is_dir():
-            print('当前环境未运行 systemd，自动更新定时器不可用。')
+            print('  当前环境未运行 systemd，自动更新定时器不可用。')
             return
         p = execute(['systemctl', 'is-enabled', 'cnip-update.timer'], check=False)
-        print('定时更新：' + ('已启用' if p.returncode == 0 else '未启用'))
+        field('开机启用', '已启用' if p.returncode == 0 else '未启用')
         running = execute(['systemctl', 'is-active', 'cnip-update.timer'], check=False)
-        print('定时器运行状态：' + ('运行中' if running.returncode == 0 else '未运行，请检查 systemctl status cnip-update.timer'))
+        field('定时器状态', '运行中' if running.returncode == 0 else '未运行')
+        field('更新频率', '每天一次，随机延迟最多 1 小时')
+        if running.returncode != 0:
+            print('\n  若已启用但未运行，请检查：')
+            print('  systemctl status cnip-update.timer')
         return
     if action == 'enable':
         if not Path('/run/systemd/system').is_dir():
@@ -719,7 +751,9 @@ def systemd_action(action: str) -> None:
         put_file(SYSTEMD_TIMER, timer)
         execute(['systemctl', 'daemon-reload'])
         execute(['systemctl', 'enable', '--now', 'cnip-update.timer'])
-        print('✅ 已设置每日自动更新（systemd timer，随机延迟最多一小时）。')
+        completed('已设置每日自动更新。')
+        field('更新频率', '每天一次，随机延迟最多 1 小时')
+        field('目标容器', selected)
     else:
         for path in (SYSTEMD_SERVICE, SYSTEMD_TIMER):
             if path.is_symlink():
@@ -735,7 +769,7 @@ def systemd_action(action: str) -> None:
                 path.unlink()
         if Path('/run/systemd/system').is_dir():
             execute(['systemctl', 'daemon-reload'])
-        print('✅ 已关闭自动更新。')
+        completed('已关闭自动更新。')
 
 
 def do_uninstall(env: Environment) -> None:
@@ -744,13 +778,19 @@ def do_uninstall(env: Environment) -> None:
     backup = transact(env, state, 'uninstall', delete_all=True)
     systemd_action('disable')
     binary = Path('/usr/local/bin/cnip')
-    if binary.is_file() and not binary.is_symlink():
+    binary_status = '未安装或已移除'
+    if binary.is_symlink():
+        binary_status = '保留符号链接，请自行检查'
+    elif binary.is_file():
         if 'cnip — 1Panel OpenResty mainland-China IP access policy manager' not in binary.read_text(encoding='utf-8'):
-            print('⚠️ /usr/local/bin/cnip 不是本项目脚本，已保留。')
+            binary_status = '保留非本项目文件'
         else:
             binary.unlink()
-    print(f'✅ 已取消 cnip 管理的所有限制并卸载命令。备份仍保留：{backup}')
-    print('注意：不会删除旧版本脚本的规则、其他第三方防火墙或独立安全组规则。')
+            binary_status = '已删除'
+    completed('已取消 cnip 管理的所有限制。', backup)
+    field('命令文件', binary_status)
+    field('自动更新', '已关闭')
+    print('\n  备份已保留；旧版规则及第三方防火墙未改动。')
 
 
 @contextlib.contextmanager
@@ -769,7 +809,7 @@ def operation_lock():
 
 def yn(question: str, default: bool = False) -> bool:
     while True:
-        answer = input(question + (' [Y/n]：' if default else ' [y/N]：')).strip().lower()
+        answer = input('\n  ' + question + (' [Y/n]：' if default else ' [y/N]：')).strip().lower()
         if not answer:
             return default
         if answer in ('y', 'yes', '是', '1'):
@@ -834,10 +874,10 @@ def menu_loop() -> None:
                 if choice not in [str(n) for n in range(1, 14)]:
                     print('请输入有效菜单数字。')
                     continue
-                section('操作结果')
+                section(next(label for _, items in groups for number, label in items if number == int(choice)))
                 print('  正在识别 OpenResty……', flush=True)
                 env = environment()
-                if choice != '3':
+                if choice not in ('3', '9'):
                     print(f'  已识别：{env.container}', flush=True)
                 if choice == '1':
                     do_add(env, input('输入需要限制的完整域名：'))
@@ -848,11 +888,21 @@ def menu_loop() -> None:
                 elif choice == '4':
                     do_update(env)
                 elif choice == '5':
+                    print('  支持 IPv4、IPv6 或 CIDR 网段。')
+                    print('  自定义放行对全部受保护域名生效。\n')
                     do_allow(env, 'add', input('输入放行 IPv4 / IPv6 / CIDR：'))
                 elif choice == '6':
+                    allowed = load_state(env)['extra_allow']
+                    print('\n  当前自定义放行 IP：')
+                    for address in allowed:
+                        print('    • ' + address)
+                    if not allowed:
+                        print('    无')
                     do_allow(env, 'remove', input('输入要删除的 IPv4 / IPv6 / CIDR：'))
                 elif choice == '7':
                     enabled = not load_state(env)['acme_exempt']
+                    field('当前状态', '已关闭' if enabled else '已开启')
+                    field('验证路径', '/.well-known/acme-challenge/')
                     if yn('确定' + ('启用' if enabled else '关闭') + ' ACME HTTP-01 例外？'):
                         do_acme(env, enabled)
                     else:
@@ -863,7 +913,13 @@ def menu_loop() -> None:
                     do_repair(env)
                 elif choice == '12':
                     do_backups()
-                    name = input('请输入要恢复的备份完整名称（留空取消）：').strip()
+                    name = input('输入备份序号或完整名称（留空取消）：').strip()
+                    if name.isdecimal():
+                        available = backup_dirs()[:20]
+                        index = int(name)
+                        if not 1 <= index <= len(available):
+                            raise CnipError('备份序号无效，请选择列表中的序号。')
+                        name = available[index - 1].name
                     if name and yn(f'恢复 {name} 会覆盖当前配置，确定继续？'):
                         do_restore(env, name)
                     else:
@@ -876,7 +932,7 @@ def menu_loop() -> None:
                     else:
                         print('已取消卸载。')
         except (CnipError, OSError, ValueError, KeyError, json.JSONDecodeError) as e:
-            print('❌ 操作失败：', e)
+            show_error(e)
         except (EOFError, KeyboardInterrupt):
             pause = False
             raise
@@ -955,8 +1011,8 @@ if __name__ == '__main__':
     try:
         main()
     except (CnipError, OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
-        print('❌ ' + str(exc), file=sys.stderr)
+        show_error(exc, sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
-        print('\n已中断操作。', file=sys.stderr)
+        print('\n  [退出] 已中断操作。', file=sys.stderr)
         sys.exit(130)

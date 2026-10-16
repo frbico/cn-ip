@@ -141,7 +141,8 @@ path.write_text('\\n'.join(f'2001:db8:{i:x}::/48' if v6 else f'1.2.{i}.0/24' for
             out = self.menu(['8', '1', '8', '3', '8', '2', '0'])
         self.assertNotIn('操作失败', out)
         self.assertIn('已设置每日自动更新', out)
-        self.assertIn('定时器运行状态：运行中', out)
+        self.assertIn('定时器状态', out)
+        self.assertIn('运行中', out)
         self.assertIn('已关闭自动更新', out)
         self.assertFalse(service.exists())
         self.assertFalse(timer.exists())
@@ -165,6 +166,22 @@ path.write_text('\\n'.join(f'2001:db8:{i:x}::/48' if v6 else f'1.2.{i}.0/24' for
             out = self.menu(['3', '0'])
         self.assertIn('另一个 cnip 操作', out)
         self.assertFalse(self.log.exists())
+
+    def test_restore_by_number_uses_displayed_backup(self):
+        self.menu(['1', 'example.com', '0'])
+        out = self.menu(['12', '1', '是', '0'])
+        self.assertIn('已恢复', out)
+        self.assertNotIn('操作失败', out)
+        self.assertEqual(cnip.load_state(self.env)['domains'], [])
+        self.assertNotIn('CNIP-MANAGED', self.site.read_text())
+
+    def test_invalid_backup_number_keeps_current_configuration(self):
+        self.menu(['1', 'example.com', '0'])
+        before = self.site.read_bytes()
+        out = self.menu(['12', '999', '0'])
+        self.assertIn('备份序号无效', out)
+        self.assertEqual(self.site.read_bytes(), before)
+        self.assertEqual(cnip.load_state(self.env)['domains'], ['example.com'])
 
     def test_confirmation_reprompts_after_invalid_answer(self):
         with mock.patch('builtins.input', side_effect=['wrong', '是']), \
