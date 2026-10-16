@@ -46,11 +46,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Publish v1.0.1 only after all checks pass
+      - name: Publish v1.0.2 only after all checks pass
         uses: actions/github-script@v7
         with:
           script: |
-            const tag = 'v1.0.1';
+            const tag = 'v1.0.2';
             const repo = context.repo;
             try {
               await github.rest.repos.getReleaseByTag({...repo, tag});
@@ -63,17 +63,17 @@ jobs:
               ...repo,
               tag_name: tag,
               target_commitish: context.sha,
-              name: 'cn-ip v1.0.1',
+              name: 'cn-ip v1.0.2',
               body: [
-                '修复中文交互菜单的静默等待及首次 IP 库更新问题。',
+                '优化中文终端界面，提升菜单与状态结果的可读性。',
                 '',
-                '- Docker、Nginx、systemd 与下载调用均设有超时，增加阶段提示。',
-                '- 菜单空闲及结果停留时释放操作锁；并发操作立即提示。',
-                '- 第 3 项明确显示状态，第 4 项支持未启用域名时初始化 IPv4/IPv6 库。',
-                '- 操作结果停留显示，只有 Enter 才返回主菜单；所有输入处 Ctrl+C 退出工具。',
-                '- 配置写入中按 Ctrl+C 同样回滚，补充完整菜单流程与阻塞回归测试。',
+                '- 主菜单按域名与 IP 库、访问例外、维护与备份分组，统一编号与间距。',
+                '- 状态页分区显示运行环境、域名、IP 地址库和访问例外。',
+                '- 中文标签按显示宽度对齐，时间去除微秒并明确显示服务器本地时区。',
+                '- 删除重复容器信息，自动更新子菜单与备份页采用清晰分行排版。',
+                '- 保留 Enter 返回主菜单、所有输入处 Ctrl+C 退出及中断回滚逻辑。',
                 '',
-                '升级前先在旧菜单输入 0 退出，再重新运行 README 中的安装命令。'
+                '升级前在旧菜单输入 0 退出，再重新执行 README 中的安装命令。'
               ].join('\n'),
               draft: false,
               prerelease: false

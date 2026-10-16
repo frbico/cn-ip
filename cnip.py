@@ -18,10 +18,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-VERSION = '1.0.1'
+VERSION = '1.0.2'
 CONF_DEST = '/usr/local/openresty/nginx/conf/conf.d'
 NGINX = '/usr/local/openresty/nginx/sbin/nginx'
 GLOBAL_FILENAME = '00-cnip-managed.conf'
@@ -560,20 +561,60 @@ def do_repair(env: Environment) -> None:
     print(f'✅ 已重新同步配置，备份：{folder}')
 
 
+def section(title: str) -> None:
+    print(f'\n  {title}')
+    print('  ' + '─' * 48)
+
+
+def field(label: str, value: object) -> None:
+    # Account for full-width Chinese characters when aligning terminal columns.
+    label += '：'
+    width = sum(2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1 for ch in label)
+    print('  ' + label + ' ' * max(1, 14 - width) + str(value))
+
+
+def readable_time(value: Optional[str]) -> str:
+    if not value:
+        return '尚未更新'
+    try:
+        when = dt.datetime.fromisoformat(value)
+        if when.tzinfo is None:
+            return when.strftime('%Y-%m-%d %H:%M:%S') + '（时区未知）'
+        when = when.astimezone()
+        offset = when.strftime('%z')
+        zone = 'UTC' + offset[:3] + ':' + offset[3:]
+        return when.strftime('%Y-%m-%d %H:%M:%S') + ' ' + zone
+    except (TypeError, ValueError):
+        return '更新时间格式异常，请运行 cnip doctor 检查'
+
+
 def do_list(env: Environment) -> None:
     state = load_state(env)
-    print('OpenResty：', env.container)
-    print('宿主机网站目录：', env.webroot)
-    print('Nginx 配置目录：', env.confdir)
-    print('受保护域名（仅允许中国大陆 IP）：')
-    for domain in state['domains']:
-        print('  •', domain)
-    if not state['domains']:
-        print('  （无）')
-    print(f'IP 地址库：IPv4 {state["ipv4_count"]} 段 / IPv6 {state["ipv6_count"]} 段')
-    print('最近更新：', state['ip_updated_at'] or '尚未更新')
-    print('额外放行 IP：', ', '.join(state['extra_allow']) or '（无）')
-    print('ACME HTTP-01 验证路径例外：', '开' if state['acme_exempt'] else '关')
+    section('运行环境')
+    field('OpenResty', env.container)
+    field('网站目录', env.webroot)
+    field('配置目录', env.confdir)
+
+    section(f'受保护域名 · {len(state["domains"])} 个')
+    if state['domains']:
+        for domain in state['domains']:
+            print('  • ' + domain)
+        print('  以上域名仅允许中国大陆 IP 及自定义放行地址访问。')
+    else:
+        print('  暂无受保护域名，尚未开启访问限制。')
+        print('  如需开启，请返回主菜单选择 1。')
+
+    section('IP 地址库')
+    field('地址段', f'IPv4 {state["ipv4_count"]} 段 / IPv6 {state["ipv6_count"]} 段')
+    field('更新于', readable_time(state['ip_updated_at']))
+
+    section('访问例外')
+    field('证书验证', '已放行 HTTP-01 验证路径' if state['acme_exempt'] else '未放行 HTTP-01 验证路径')
+    print('  自定义放行 IP：')
+    for address in state['extra_allow']:
+        print('    • ' + address)
+    if not state['extra_allow']:
+        print('    无')
 
 
 def do_doctor(env: Environment) -> None:
@@ -608,12 +649,12 @@ def backup_dirs() -> List[Path]:
 
 def do_backups() -> None:
     dirs = backup_dirs()
-    print('最近 20 份配置备份：')
+    section('配置备份 · 最近 20 份')
     for path in dirs[:20]:
         print('  ', path.name)
     if not dirs:
         print('  （无）')
-    print('目录：', BACKUPS)
+    field('备份目录', BACKUPS)
 
 
 def do_restore(env: Environment, name: str) -> None:
@@ -753,23 +794,23 @@ def menu() -> None:
 
 def menu_loop() -> None:
     while True:
-        print('\n' + '═' * 47)
-        print('  cnip · 1Panel 中国大陆 IP 访问管理  v' + VERSION)
-        print('═' * 47)
-        print('  1. 为指定域名开启中国 IP 限制')
-        print('  2. 取消指定域名限制')
-        print('  3. 查看域名 / IP 库状态')
-        print('  4. 手动更新中国 IP 地址库')
-        print('  5. 新增境外 IP / 网段放行')
-        print('  6. 删除自定义 IP 放行')
-        print('  7. 切换证书 HTTP-01 验证路径例外')
-        print('  8. 自动更新管理（systemd）')
-        print('  9. 检查并诊断 OpenResty 配置')
-        print(' 10. 修复网站规则（1Panel 改写配置后）')
-        print(' 11. 查看备份')
-        print(' 12. 从备份恢复')
-        print(' 13. 卸载 cnip 并撤销全部 cnip 限制')
-        print('  0. 退出')
+        print('\n  cnip · 1Panel 中国大陆 IP 访问管理')
+        print(f'  v{VERSION}')
+        print('  ' + '═' * 48)
+        groups = (
+            ('域名与 IP 库', ((1, '开启指定域名限制'), (2, '关闭指定域名限制'),
+                             (3, '查看域名 / IP 库状态'), (4, '更新中国 IP 地址库'))),
+            ('访问例外', ((5, '新增 IP / 网段放行'), (6, '删除自定义放行'),
+                         (7, '设置证书验证路径例外'))),
+            ('维护与备份', ((8, '自动更新管理'), (9, '检查 OpenResty 配置'),
+                           (10, '修复网站规则'), (11, '查看配置备份'), (12, '恢复配置备份'))),
+            ('退出与卸载', ((0, '退出工具'), (13, '卸载工具并撤销全部限制'))),
+        )
+        for title, items in groups:
+            print(f'\n  {title}')
+            for number, label in items:
+                print(f'   {number:>2}. {label}')
+        print('\n  Enter 返回主菜单  ·  Ctrl+C 随时退出')
         pause = False
         try:
             choice = input('\n请输入数字：').strip()
@@ -778,7 +819,8 @@ def menu_loop() -> None:
             pause = True
             with operation_lock():
                 if choice == '8':
-                    print('1. 开启  2. 关闭  3. 查看状态')
+                    section('自动更新管理')
+                    print('   1. 开启每日更新\n   2. 关闭每日更新\n   3. 查看运行状态')
                     arg = {'1': 'enable', '2': 'disable', '3': 'status'}.get(input('请选择：').strip())
                     if arg:
                         print('正在处理自动更新设置……', flush=True)
@@ -792,9 +834,11 @@ def menu_loop() -> None:
                 if choice not in [str(n) for n in range(1, 14)]:
                     print('请输入有效菜单数字。')
                     continue
-                print('正在识别 1Panel / OpenResty（Docker 调用超时 15 秒）……', flush=True)
+                section('操作结果')
+                print('  正在识别 OpenResty……', flush=True)
                 env = environment()
-                print(f'已识别 OpenResty：{env.container}', flush=True)
+                if choice != '3':
+                    print(f'  已识别：{env.container}', flush=True)
                 if choice == '1':
                     do_add(env, input('输入需要限制的完整域名：'))
                 elif choice == '2':
