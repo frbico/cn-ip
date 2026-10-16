@@ -336,6 +336,16 @@ class ReleaseRegressionTests(unittest.TestCase):
 
 
 class MenuTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        patch = mock.patch.object(cnip, 'LOCK', Path(temp.name) / 'lock')
+        tty = mock.patch.object(sys.stdin, 'isatty', return_value=False)
+        patch.start()
+        tty.start()
+        self.addCleanup(temp.cleanup)
+        self.addCleanup(patch.stop)
+        self.addCleanup(tty.stop)
+
     def test_all_numeric_actions(self):
         cases = [
             (['1', 'example.com', '0'], 'do_add'),
@@ -349,13 +359,16 @@ class MenuTests(unittest.TestCase):
             (['8', '3', '0'], 'systemd_action'),
             (['9', '0'], 'do_doctor'), (['10', '0'], 'do_repair'),
             (['11', '0'], 'do_backups'),
-            (['12', 'y', '20261016-120000-000000-add', '0'], 'do_restore'),
+            (['12', '20261016-120000-000000-add', 'y', '0'], 'do_restore'),
             (['13', 'y', 'y'], 'do_uninstall'),
         ]
         for inputs, action in cases:
+            answers = iter(inputs)
+            def read(prompt):
+                return '' if '按回车' in prompt else next(answers)
             with self.subTest(action=action, inputs=inputs), \
-                 mock.patch('builtins.input', side_effect=inputs), \
-                 mock.patch.object(cnip, 'environment', return_value=object()), \
+                 mock.patch('builtins.input', side_effect=read), \
+                 mock.patch.object(cnip, 'environment', return_value=cnip.Environment('fake-resty', Path('/tmp'), Path('/tmp'))), \
                  mock.patch.object(cnip, 'load_state', return_value=cnip.initial_state()), \
                  mock.patch.object(cnip, 'do_backups'), \
                  mock.patch.object(cnip, action) as call, \
@@ -379,7 +392,7 @@ class EnvironmentAndTimerTests(unittest.TestCase):
             obj = [{'Name': '/1panel-openresty-abcd', 'Config': {'Image': '1panel/openresty:latest'},
                     'Mounts': [{'Type': 'bind', 'Destination': '/www', 'Source': str(www)},
                                {'Type': 'bind', 'Destination': cnip.CONF_DEST, 'Source': str(conf)}]}]
-            responses = [subprocess.CompletedProcess([], 0, stdout='abc\n'),
+            responses = [subprocess.CompletedProcess([], 0, stdout='abc\t1panel/openresty:latest\t1panel-openresty-abcd\n'),
                          subprocess.CompletedProcess([], 0, stdout=json.dumps(obj))]
             with mock.patch.object(cnip, 'execute', side_effect=responses), mock.patch.dict(cnip.os.environ, {'CNIP_CONTAINER': ''}):
                 env = cnip.environment()

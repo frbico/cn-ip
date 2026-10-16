@@ -2,7 +2,7 @@
 
 发布需要仓库写入权限。请通过 GitHub 官方登录或已授权的连接完成，不要共享密码或令牌。
 
-`main` 分支推送后，GitHub Actions 会运行 Python 测试矩阵、真实 Nginx 回归和安装器测试，全部通过后自动创建 `v1.0.0` Release。若该 Release 已存在则保持不变；不会移动已有标签或覆盖 Release。Release 作业仅对本仓库 `main` 的 push 生效，使用 GitHub 自动提供的 `GITHUB_TOKEN`，无需上传凭据。仓库需要启用 Actions，并允许该作业的 `contents: write` 权限。
+`main` 分支推送后，GitHub Actions 会运行 Python 测试矩阵、真实 Nginx 回归和安装器测试，全部通过后自动创建 `v1.0.1` Release。若该 Release 已存在则保持不变；不会移动已有标签或覆盖 Release。Release 作业仅对本仓库 `main` 的 push 生效，使用 GitHub 自动提供的 `GITHUB_TOKEN`，无需上传凭据。仓库需要启用 Actions，并允许该作业的 `contents: write` 权限。
 
 如果你拿到的是 `cn-ip.zip` 文件，可以在自己的电脑或可访问 GitHub 的服务器上运行：
 

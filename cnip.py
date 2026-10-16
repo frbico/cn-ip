@@ -21,7 +21,7 @@ import tempfile
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 CONF_DEST = '/usr/local/openresty/nginx/conf/conf.d'
 NGINX = '/usr/local/openresty/nginx/sbin/nginx'
 GLOBAL_FILENAME = '00-cnip-managed.conf'
@@ -47,9 +47,11 @@ class CnipError(Exception):
     pass
 
 
-def execute(args: Sequence[str], check: bool = True) -> subprocess.CompletedProcess:
+def execute(args: Sequence[str], check: bool = True, timeout: float = 30) -> subprocess.CompletedProcess:
     try:
-        p = subprocess.run(args, capture_output=True, text=True, check=False)
+        p = subprocess.run(args, capture_output=True, text=True, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        raise CnipError(f'命令在 {timeout:g} 秒内未完成，已停止等待：{" ".join(args)}。请检查 Docker / OpenResty / 网络连接后重试。') from e
     except FileNotFoundError as e:
         raise CnipError(f'找不到命令：{args[0]}') from e
     if check and p.returncode:
@@ -100,15 +102,24 @@ class Environment:
 
 
 def find_environments() -> List[Environment]:
-    result = execute(['docker', 'ps', '--format', '{{.ID}}']).stdout.splitlines()
+    # List metadata first: unrelated containers must not require individual inspect calls.
+    listing = execute(['docker', 'ps', '--format', '{{.ID}}\t{{.Image}}\t{{.Names}}'], timeout=15).stdout
+    selected = os.environ.get('CNIP_CONTAINER', '').strip()
+    ids = []
+    for row in listing.splitlines():
+        fields = row.split('\t')
+        if len(fields) != 3:
+            raise CnipError('Docker 容器列表格式异常，请检查 docker ps 是否正常。')
+        cid, image, name = fields
+        if (selected and name == selected) or (not selected and 'openresty' in (image + ' ' + name).lower()):
+            ids.append(cid)
+    if not ids:
+        return []
+    objects = json.loads(execute(['docker', 'inspect', *ids], timeout=15).stdout)
     environments: List[Environment] = []
-    for cid in result:
-        obj = json.loads(execute(['docker', 'inspect', cid]).stdout)[0]
-        image = (obj.get('Config', {}).get('Image') or '').lower()
+    for obj in objects:
         name = obj.get('Name', '').lstrip('/')
-        if 'openresty' not in (image + ' ' + name).lower():
-            continue
-        mounts = {m['Destination']: m['Source'] for m in obj.get('Mounts', [])
+        mounts = {m['Destination'].rstrip('/'): m['Source'] for m in obj.get('Mounts', [])
                   if m.get('Type') == 'bind' and m.get('Source')}
         if '/www' in mounts and CONF_DEST in mounts:
             env = Environment(name, Path(mounts['/www']), Path(mounts[CONF_DEST]))
@@ -306,7 +317,12 @@ def download_database(quiet: bool = False) -> Tuple[str, int, int]:
         for version in (4, 6):
             url = os.environ.get(f'CNIP_IPV{version}_URL', URLS[version])
             path = Path(tmp) / f'ipv{version}.txt'
-            execute(['curl', '-fL', '-sS', '--retry', '3', '--connect-timeout', '12', '--max-time', '150', '--proto', '=https', '--proto-redir', '=https', '--tlsv1.2', url, '-o', str(path)])
+            if not quiet:
+                print(f'正在下载 IPv{version} 中国 IP 库（最多等待 110 秒，可按 Ctrl+C 取消）……', flush=True)
+            execute(['curl', '-fL', '-sS', '--retry', '1', '--retry-delay', '1',
+                     '--connect-timeout', '10', '--max-time', '45', '--max-redirs', '5',
+                     '--proto', '=https', '--proto-redir', '=https', '--tlsv1.2',
+                     url, '-o', str(path)], timeout=110)
             if path.stat().st_size < 1024 or path.stat().st_size > 8 * 1024 * 1024:
                 raise CnipError(f'IPv{version} 数据文件大小异常，停止启用。')
             networks = set()
@@ -326,7 +342,7 @@ def download_database(quiet: bool = False) -> Tuple[str, int, int]:
             counts[version] = len(networks)
             rows.extend(f'{net} 1;' for net in sorted(networks, key=lambda x: (int(x.network_address), x.prefixlen)))
             if not quiet:
-                print(f'  IPv{version}：已验证 {counts[version]} 条地址段')
+                print(f'  IPv{version}：已验证 {counts[version]} 条地址段', flush=True)
     return GEO_HEADER + '\n127.0.0.1 1;\n::1 1;\n' + '\n'.join(rows) + '\n', counts[4], counts[6]
 
 
@@ -418,6 +434,7 @@ def transact(env: Environment, new_state: dict, action: str,
         require_owned(path, header)
     if env.statefile.is_symlink():
         raise CnipError('状态文件不允许是符号链接。')
+    print('正在检查现有 OpenResty 配置……', flush=True)
     env.nginx('-t')
     configs = generate_configs(new_state)
     selected = set(new_state['domains'])
@@ -439,6 +456,7 @@ def transact(env: Environment, new_state: dict, action: str,
         if new_geo is not None:
             planned[env.storage / 'china.geo'] = new_geo
     folder = backup_snapshot(list(planned), action)
+    print(f'已备份：{folder}，正在写入并验证配置……', flush=True)
     try:
         for path, value in planned.items():
             if value is None:
@@ -446,8 +464,9 @@ def transact(env: Environment, new_state: dict, action: str,
             else:
                 put_file(path, value)
         nginx_verify(env, bool(selected))
+        print('配置检查通过，正在重载 OpenResty……', flush=True)
         env.nginx('-s', 'reload')
-    except Exception:
+    except (Exception, KeyboardInterrupt):
         print('⚠️ 应用失败，正在恢复修改前配置……', file=sys.stderr)
         restore_snapshot(folder, env)
         try:
@@ -491,9 +510,9 @@ def do_remove(env: Environment, name: str) -> None:
 def do_update(env: Environment, quiet: bool = False) -> None:
     state = load_state(env)
     if not state['domains']:
-        if not quiet:
-            print('当前没有受保护的域名，无需更新。')
-        return
+        if quiet:
+            return
+        print('尚未启用域名限制：本次只初始化 IP 库，不会开启任何域名限制。', flush=True)
     geo, state['ipv4_count'], state['ipv6_count'] = download_database(quiet)
     state['ip_updated_at'] = dt.datetime.now(dt.timezone.utc).isoformat()
     backup = transact(env, state, 'update', geo)
@@ -508,9 +527,15 @@ def do_allow(env: Environment, action: str, value: str) -> None:
         raise CnipError('请先给一个域名启用限制，再管理自定义 IP 放行。')
     allowed = set(state['extra_allow'])
     if action == 'add':
+        if value in allowed:
+            print(f'{value} 已在自定义放行列表中，无需重复添加。')
+            return
         allowed.add(value)
     else:
-        allowed.discard(value)
+        if value not in allowed:
+            print(f'{value} 不在自定义放行列表中，无需删除。')
+            return
+        allowed.remove(value)
     state['extra_allow'] = sorted(allowed)
     folder = transact(env, state, 'allow-' + action)
     print(f'✅ 已{ "放行" if action == "add" else "删除放行" } {value}，备份：{folder}')
@@ -610,7 +635,7 @@ def do_restore(env: Environment, name: str) -> None:
         state = load_state(env)
         nginx_verify(env, bool(state['domains']))
         env.nginx('-s', 'reload')
-    except Exception:
+    except (Exception, KeyboardInterrupt):
         restore_snapshot(rollback, env)
         with contextlib.suppress(Exception):
             env.nginx('-t')
@@ -621,8 +646,13 @@ def do_restore(env: Environment, name: str) -> None:
 
 def systemd_action(action: str) -> None:
     if action == 'status':
+        if not Path('/run/systemd/system').is_dir():
+            print('当前环境未运行 systemd，自动更新定时器不可用。')
+            return
         p = execute(['systemctl', 'is-enabled', 'cnip-update.timer'], check=False)
         print('定时更新：' + ('已启用' if p.returncode == 0 else '未启用'))
+        running = execute(['systemctl', 'is-active', 'cnip-update.timer'], check=False)
+        print('定时器运行状态：' + ('运行中' if running.returncode == 0 else '未运行，请检查 systemctl status cnip-update.timer'))
         return
     if action == 'enable':
         if not Path('/run/systemd/system').is_dir():
@@ -657,8 +687,8 @@ def systemd_action(action: str) -> None:
                 header = '[Unit]\nDescription=' + ('Update cnip' if path == SYSTEMD_SERVICE else 'Daily cnip')
                 if not path.read_text().startswith(header):
                     raise CnipError(f'{path} 不是 cnip 的服务文件，拒绝删除。')
-        if Path('/run/systemd/system').is_dir():
-            execute(['systemctl', 'disable', '--now', 'cnip-update.timer'], check=False)
+        if Path('/run/systemd/system').is_dir() and SYSTEMD_TIMER.exists():
+            execute(['systemctl', 'disable', '--now', 'cnip-update.timer'])
         for path in (SYSTEMD_SERVICE, SYSTEMD_TIMER):
             if path.exists():
                 path.unlink()
@@ -682,12 +712,46 @@ def do_uninstall(env: Environment) -> None:
     print('注意：不会删除旧版本脚本的规则、其他第三方防火墙或独立安全组规则。')
 
 
+@contextlib.contextmanager
+def operation_lock():
+    """Lock one operation; an idle menu must not block timers or other terminals."""
+    with open(LOCK, 'a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as e:
+            raise CnipError('另一个 cnip 操作正在执行，请稍后重试；不会在后台无限等待。') from e
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def yn(question: str, default: bool = False) -> bool:
-    answer = input(question + (' [Y/n]：' if default else ' [y/N]：')).strip().lower()
-    return answer in ('y', 'yes') or (default and answer == '')
+    while True:
+        answer = input(question + (' [Y/n]：' if default else ' [y/N]：')).strip().lower()
+        if not answer:
+            return default
+        if answer in ('y', 'yes', '是', '1'):
+            return True
+        if answer in ('n', 'no', '否', '0'):
+            return False
+        print('请输入 y / n（也可输入 是 / 否 或 1 / 0）。', flush=True)
+
+
+def wait_for_menu() -> None:
+    while input('\n按回车返回主菜单（Enter），Ctrl+C 退出：').strip():
+        print('请直接按 Enter 返回主菜单，或按 Ctrl+C 退出。', flush=True)
 
 
 def menu() -> None:
+    print('提示：所有输入处均可按 Ctrl+C 退出工具。', flush=True)
+    try:
+        menu_loop()
+    except EOFError:
+        print('\n输入已结束。')
+
+
+def menu_loop() -> None:
     while True:
         print('\n' + '═' * 47)
         print('  cnip · 1Panel 中国大陆 IP 访问管理  v' + VERSION)
@@ -706,57 +770,75 @@ def menu() -> None:
         print(' 12. 从备份恢复')
         print(' 13. 卸载 cnip 并撤销全部 cnip 限制')
         print('  0. 退出')
+        pause = False
         try:
             choice = input('\n请输入数字：').strip()
             if choice == '0':
                 return
-            if choice == '8':
-                print('1. 开启  2. 关闭  3. 查看状态')
-                arg = {'1': 'enable', '2': 'disable', '3': 'status'}.get(input('请选择：').strip())
-                if arg:
-                    systemd_action(arg)
-                continue
-            if choice == '11':
-                do_backups()
-                continue
-            if choice not in [str(n) for n in range(1, 14)]:
-                print('请输入有效菜单数字。')
-                continue
-            env = environment()
-            if choice == '1':
-                do_add(env, input('输入需要限制的完整域名：'))
-            elif choice == '2':
-                do_remove(env, input('输入需要取消限制的完整域名：'))
-            elif choice == '3':
-                do_list(env)
-            elif choice == '4':
-                do_update(env)
-            elif choice == '5':
-                do_allow(env, 'add', input('输入放行 IPv4 / IPv6 / CIDR：'))
-            elif choice == '6':
-                do_allow(env, 'remove', input('输入要删除的 IPv4 / IPv6 / CIDR：'))
-            elif choice == '7':
-                enabled = not load_state(env)['acme_exempt']
-                if yn('确定' + ('启用' if enabled else '关闭') + ' ACME HTTP-01 例外？'):
-                    do_acme(env, enabled)
-            elif choice == '9':
-                do_doctor(env)
-            elif choice == '10':
-                do_repair(env)
-            elif choice == '12':
-                do_backups()
-                do_restore(env, input('请输入要恢复的备份完整名称：').strip()) if yn('恢复会覆盖当前配置，确定继续？') else None
-            elif choice == '13':
-                if yn('确定撤销全部 cnip 规则并删除 cnip 命令吗？') and yn('最终确认，不影响旧版规则：'):
-                    do_uninstall(env)
-                    return
+            pause = True
+            with operation_lock():
+                if choice == '8':
+                    print('1. 开启  2. 关闭  3. 查看状态')
+                    arg = {'1': 'enable', '2': 'disable', '3': 'status'}.get(input('请选择：').strip())
+                    if arg:
+                        print('正在处理自动更新设置……', flush=True)
+                        systemd_action(arg)
+                    else:
+                        print('无效选择，请输入 1、2 或 3。', flush=True)
+                    continue
+                if choice == '11':
+                    do_backups()
+                    continue
+                if choice not in [str(n) for n in range(1, 14)]:
+                    print('请输入有效菜单数字。')
+                    continue
+                print('正在识别 1Panel / OpenResty（Docker 调用超时 15 秒）……', flush=True)
+                env = environment()
+                print(f'已识别 OpenResty：{env.container}', flush=True)
+                if choice == '1':
+                    do_add(env, input('输入需要限制的完整域名：'))
+                elif choice == '2':
+                    do_remove(env, input('输入需要取消限制的完整域名：'))
+                elif choice == '3':
+                    do_list(env)
+                elif choice == '4':
+                    do_update(env)
+                elif choice == '5':
+                    do_allow(env, 'add', input('输入放行 IPv4 / IPv6 / CIDR：'))
+                elif choice == '6':
+                    do_allow(env, 'remove', input('输入要删除的 IPv4 / IPv6 / CIDR：'))
+                elif choice == '7':
+                    enabled = not load_state(env)['acme_exempt']
+                    if yn('确定' + ('启用' if enabled else '关闭') + ' ACME HTTP-01 例外？'):
+                        do_acme(env, enabled)
+                    else:
+                        print('已取消修改证书验证路径例外。')
+                elif choice == '9':
+                    do_doctor(env)
+                elif choice == '10':
+                    do_repair(env)
+                elif choice == '12':
+                    do_backups()
+                    name = input('请输入要恢复的备份完整名称（留空取消）：').strip()
+                    if name and yn(f'恢复 {name} 会覆盖当前配置，确定继续？'):
+                        do_restore(env, name)
+                    else:
+                        print('已取消恢复。')
+                elif choice == '13':
+                    if yn('确定撤销全部 cnip 规则并删除 cnip 命令吗？') and yn('最终确认，不影响旧版规则：'):
+                        do_uninstall(env)
+                        pause = False
+                        return
+                    else:
+                        print('已取消卸载。')
         except (CnipError, OSError, ValueError, KeyError, json.JSONDecodeError) as e:
             print('❌ 操作失败：', e)
-        except EOFError:
-            print('\n输入已结束。')
-            return
-        except KeyboardInterrupt:
-            print('\n已取消当前操作。')
+        except (EOFError, KeyboardInterrupt):
+            pause = False
+            raise
+        finally:
+            if pause:
+                wait_for_menu()
 
 
 def main() -> None:
@@ -778,9 +860,7 @@ def main() -> None:
     if os.geteuid() != 0:
         p.error('请使用 root 运行（sudo cnip）。')
     if args.command is None:
-        with open(LOCK, 'a') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            menu()
+        menu()
         return
     if args.command == 'backups':
         do_backups()
@@ -789,12 +869,12 @@ def main() -> None:
         if args.mode == 'status':
             systemd_action(args.mode)
             return
-        with open(LOCK, 'a') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        with operation_lock():
             systemd_action(args.mode)
         return
-    with open(LOCK, 'a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with operation_lock():
+        if not (args.command == 'update' and args.quiet):
+            print('正在识别 1Panel / OpenResty……', flush=True)
         env = environment()
         if args.command == 'add':
             do_add(env, args.domain)
