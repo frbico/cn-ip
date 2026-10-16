@@ -152,6 +152,16 @@ class FileAndTransactionTests(unittest.TestCase):
 
 
 class CLIArgumentTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root_patch = mock.patch.object(cnip.os, 'geteuid', return_value=0)
+        self.lock_patch = mock.patch.object(cnip, 'LOCK', Path(self.temp.name) / 'cnip.lock')
+        self.root_patch.start()
+        self.lock_patch.start()
+        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(self.root_patch.stop)
+        self.addCleanup(self.lock_patch.stop)
+
     def test_auto_update_dispatch(self):
         with mock.patch.object(sys, 'argv', ['cnip', 'auto-update', 'status']), \
              mock.patch.object(cnip, 'systemd_action') as call:
